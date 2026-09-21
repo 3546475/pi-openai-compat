@@ -124,7 +124,9 @@ Three commands are available; `/compat-login` is the only one you need to get st
 
 Walks you through a short wizard:
 
-1. Select a provider from the list above (or choose Custom).
+1. Select a provider from the list above (or choose Custom).  The list is
+   searchable — start typing and it filters as you go — which matters because
+   it holds 39 templates.
 2. For Ollama, llmproxy and Custom, confirm or change the base URL.
 3. Enter your API key.  For the local templates the key is optional: press
    Enter to skip it on a default install, or supply one if you have put the
@@ -137,6 +139,28 @@ Walks you through a short wizard:
 After login, the provider's models appear in pi's `/model` command and
 `Ctrl+L` picker immediately.  You can run `/compat-login` again to add a
 second provider — all providers are active simultaneously.
+
+#### Searching the provider list
+
+`/compat-login`, `/compat-refresh` and `/compat-logout` all ask which provider
+you mean with the same picker, which filters as you type:
+
+| Key | Action |
+| --- | --- |
+| *(typing)* | Fuzzy-filter the list; the best match is highlighted |
+| `↑` / `↓` | Move the highlight (wraps at both ends) |
+| `PageUp` / `PageDown` | Move a screenful |
+| `Enter` | Choose the highlighted provider |
+| `Esc` / `Ctrl+C` | Cancel |
+
+Queries match as a case-insensitive subsequence against the display name plus
+two things that are not the display name: the provider key and the endpoint
+URL.  So `nsr` finds **Nous Research Portal**, `zhipu` finds
+**Zhipu (Z.ai / BigModel)**, and `open.bigmodel` finds the same provider by
+endpoint — none of which you can reach by guessing an arrow-key offset.  Ten
+rows are shown at a time with a `(position/total)` indicator; rows are
+truncated to the terminal width rather than wrapped, and clicking one selects
+it.
 
 ### `/compat-refresh`
 

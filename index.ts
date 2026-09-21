@@ -12,11 +12,30 @@
  *   - /compat-refresh re-fetches the model list for a registered provider.
  *   - /compat-logout  removes a provider (unregisters, restores previous model).
  *   - No activeProviders list — presence in config.providers means registered.
+ *   - Provider selection goes through the searchable picker below rather than
+ *     pi's ctx.ui.select(), which renders every option at once with no search
+ *     and no scrolling — unusable for the ~39 provider templates.
  *
  * Config: ~/.config/pi-openai-compat/config.json
  */
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+// Runtime imports: pi's extension loader aliases both the @earendil-works/* and
+// the legacy @mariozechner/* namespace to its own bundled copies (jiti `alias`),
+// so TUI components need no dependency of their own. DynamicBorder is used with
+// an explicit colour function — see the note in the searchable picker below.
+import { DynamicBorder } from "@mariozechner/pi-coding-agent";
+import {
+  Container,
+  fuzzyFilter,
+  Input,
+  SelectList,
+  Spacer,
+  Text,
+  type Component,
+  type Focusable,
+  type SelectItem,
+} from "@mariozechner/pi-tui";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
@@ -899,6 +918,263 @@ export function tryRegisterProvider(pi: ExtensionAPI, key: string, p: ProviderCo
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Searchable picker
+// ─────────────────────────────────────────────────────────────────────────────
+// pi's built-in `ctx.ui.select()` renders every option at once with no search and
+// no scrolling, which is unusable for the ~39 entries in TEMPLATES. `SelectList`
+// scrolls, but its own `setFilter()` only matches a *prefix* of the item value, so
+// the options are re-filtered here with pi-tui's `fuzzyFilter()` — the same matcher
+// behind pi's /model picker — and the matching subset is handed to a fresh
+// SelectList on every keystroke.
+
+/** Structural view of the pi theme, so the picker doesn't depend on its class. */
+interface PickerTheme {
+  fg(color: "accent" | "muted" | "dim" | "text", text: string): string;
+  bold(text: string): string;
+}
+
+/** Structural view of pi's keybinding manager (the one injected into custom UI). */
+interface PickerKeybindings {
+  matches(data: string, keybinding: string): boolean;
+}
+
+/** The slice of the TUI the picker needs. */
+interface PickerTui {
+  requestRender(): void;
+}
+
+export interface PickerItem extends SelectItem {
+  /**
+   * Extra text that can match a query without being rendered — the internal
+   * provider key and endpoint host, so "groq" finds a provider whose displayName
+   * alone wouldn't match.
+   */
+  keywords?: string;
+}
+
+/** Rows shown at once; longer lists scroll (pi's own pickers show 10). */
+export const PICKER_MAX_VISIBLE = 10;
+
+/**
+ * Searchable single-select dialog: type to fuzzy-filter, ↑↓ (PageUp/PageDown by a
+ * page) to move, Enter to confirm, Esc/Ctrl+C to cancel. Cancelling resolves to
+ * null, so callers can treat any falsy result as "user backed out".
+ */
+export class SearchablePicker extends Container implements Focusable {
+  private readonly searchInput: Input;
+  private readonly listContainer = new Container();
+  private readonly items: PickerItem[];
+  private readonly theme: PickerTheme;
+  private readonly keybindings: PickerKeybindings;
+  private readonly tui: PickerTui;
+  private readonly done: (value: string | null) => void;
+  private readonly maxVisible: number;
+
+  /** Options currently rendered, in display order. */
+  private filtered: PickerItem[];
+  /** Highlighted row, kept in sync with the list (mouse clicks and wheel included). */
+  private index = 0;
+  private list: SelectList | null = null;
+
+  // Focusable implementation: propagate focus to the search box so the terminal
+  // cursor — and with it the IME candidate window — is positioned there.
+  private _focused = false;
+  get focused(): boolean {
+    return this._focused;
+  }
+  set focused(value: boolean) {
+    this._focused = value;
+    this.searchInput.focused = value;
+  }
+
+  constructor(opts: {
+    title: string;
+    items: PickerItem[];
+    theme: PickerTheme;
+    keybindings: PickerKeybindings;
+    tui: PickerTui;
+    done: (value: string | null) => void;
+    maxVisible?: number;
+  }) {
+    super();
+    this.items = opts.items;
+    this.filtered = opts.items;
+    this.theme = opts.theme;
+    this.keybindings = opts.keybindings;
+    this.tui = opts.tui;
+    this.done = opts.done;
+    this.maxVisible = opts.maxVisible ?? PICKER_MAX_VISIBLE;
+
+    // DynamicBorder must be given an explicit colour function: extensions run in
+    // their own jiti module cache, where its module-level theme is undefined.
+    const border = (s: string) => this.theme.fg("accent", s);
+    this.addChild(new DynamicBorder(border));
+    this.addChild(new Text(this.theme.fg("accent", this.theme.bold(opts.title)), 1, 0));
+    this.addChild(new Spacer(1));
+
+    // No constructor options: `Input` gained a `placeholder` option in a later
+    // pi-tui than the one this package builds against (see devDependencies), and
+    // passing an argument to the older constructor is a type error.
+    this.searchInput = new Input();
+    // Enter inside the search box confirms the highlighted row.
+    this.searchInput.onSubmit = () => this.confirm();
+    this.addChild(this.searchInput);
+    this.addChild(new Spacer(1));
+
+    this.addChild(this.listContainer);
+    this.addChild(new Spacer(1));
+    this.addChild(new Text(this.theme.fg("dim", "Type to search · ↑↓ move · enter select · esc cancel"), 1, 0));
+    this.addChild(new DynamicBorder(border));
+
+    this.refilter("");
+  }
+
+  private selectListTheme() {
+    return {
+      selectedPrefix: (text: string) => this.theme.fg("accent", text),
+      selectedText: (text: string) => this.theme.fg("accent", text),
+      description: (text: string) => this.theme.fg("muted", text),
+      scrollInfo: (text: string) => this.theme.fg("dim", text),
+      noMatch: (text: string) => this.theme.fg("muted", text),
+    };
+  }
+
+  /** Fuzzy-filter the options for `query` and rebuild the visible list. */
+  private refilter(query: string): void {
+    this.filtered = query
+      ? fuzzyFilter(this.items, query, (item) => this.searchText(item))
+      : this.items;
+    // A new query re-ranks the list, so highlight the best match instead of
+    // keeping the old position (same behaviour as pi's /model picker).
+    this.index = 0;
+
+    this.listContainer.clear();
+    if (this.filtered.length === 0) {
+      // SelectList's own empty message says "commands"; say something accurate.
+      this.list = null;
+      this.listContainer.addChild(new Text(this.theme.fg("muted", "No matching providers"), 1, 0));
+      return;
+    }
+
+    const list = new SelectList(
+      this.filtered,
+      Math.min(this.filtered.length, this.maxVisible),
+      this.selectListTheme()
+    );
+    list.onSelect = (item) => this.done(item.value);
+    list.onCancel = () => this.done(null);
+    list.onSelectionChange = (item) => {
+      const next = this.filtered.indexOf(item);
+      if (next >= 0) this.index = next;
+    };
+    this.list = list;
+    this.listContainer.addChild(list);
+  }
+
+  /**
+   * Text a query is matched against: the label, the value, the description and
+   * any extra keywords. The description is included on purpose — for the
+   * provider templates it holds the endpoint, which is how two templates with
+   * near-identical names (Cloudflare Workers AI vs Cloudflare AI Gateway) are
+   * told apart without remembering which row is which.
+   */
+  private searchText(item: PickerItem): string {
+    return [item.label, item.value, item.description ?? "", item.keywords ?? ""].join(" ");
+  }
+
+  /** Move the highlight by `delta` rows, wrapping at either end. */
+  private move(delta: number): void {
+    if (this.filtered.length === 0) return;
+    this.index = (this.index + delta + this.filtered.length) % this.filtered.length;
+    this.list?.setSelectedIndex(this.index);
+    this.tui.requestRender();
+  }
+
+  private confirm(): void {
+    const item = this.list?.getSelectedItem() ?? this.filtered[this.index];
+    if (item) this.done(item.value);
+  }
+
+  handleInput(data: string): void {
+    const kb = this.keybindings;
+    if (kb.matches(data, "tui.select.up")) {
+      this.move(-1);
+    } else if (kb.matches(data, "tui.select.down")) {
+      this.move(1);
+    } else if (kb.matches(data, "tui.select.pageUp")) {
+      this.move(-this.maxVisible);
+    } else if (kb.matches(data, "tui.select.pageDown")) {
+      this.move(this.maxVisible);
+    } else if (kb.matches(data, "tui.select.confirm")) {
+      this.confirm();
+    } else if (kb.matches(data, "tui.select.cancel")) {
+      this.done(null);
+    } else {
+      // Everything else is query text — typing "j"/"k" must search, not navigate.
+      this.searchInput.handleInput(data);
+      this.refilter(this.searchInput.getValue());
+      this.tui.requestRender();
+    }
+  }
+}
+
+/** Show `items` in the searchable picker. Resolves to the chosen value, or null. */
+export async function pickFromList(
+  ctx: {
+    ui: {
+      custom<T>(
+        factory: (
+          tui: PickerTui,
+          theme: PickerTheme,
+          keybindings: PickerKeybindings,
+          done: (result: T) => void
+        ) => Component & { dispose?(): void }
+      ): Promise<T>;
+    };
+  },
+  title: string,
+  items: PickerItem[]
+): Promise<string | null> {
+  return ctx.ui.custom<string | null>((tui, theme, keybindings, done) =>
+    new SearchablePicker({ title, items, theme, keybindings, tui, done })
+  );
+}
+
+/**
+ * Picker entries for every provider template, in `TEMPLATES` order.
+ *
+ * The entry value is the template key, never the display name: two templates
+ * sharing a name stay distinguishable, and the caller has nothing to map back
+ * after the pick (the previous `labels.indexOf(chosen)` lookup had both bugs).
+ */
+export function providerPickerItems(): PickerItem[] {
+  return Object.keys(TEMPLATES).map((key) => ({
+    value: key,
+    label: TEMPLATES[key].displayName,
+    description: TEMPLATES[key].baseUrl,
+    keywords: key,
+  }));
+}
+
+/**
+ * Picker entries for the providers already saved in the config, shared by
+ * /compat-refresh and /compat-logout. The internal key rides along as both a
+ * description and a search keyword, so duplicate display names stay
+ * distinguishable and typing the key finds a provider whose display name
+ * alone would not match.
+ */
+export function registeredProviderItems(
+  providers: Record<string, { displayName: string }>
+): PickerItem[] {
+  return Object.keys(providers).map((key) => ({
+    value: key,
+    label: providers[key].displayName,
+    description: `[${key}]`,
+    keywords: key,
+  }));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Extension — async factory so registration completes before pi shows /model
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1003,12 +1279,10 @@ export default async function (pi: ExtensionAPI) {
   pi.registerCommand("compat-login", {
     description: "Fetch models from an OpenAI-compatible endpoint and add it to /model",
     handler: async (args, ctx) => {
-      // Step 1 — pick provider template
-      const keys = Object.keys(TEMPLATES);
-      const labels = keys.map((k) => TEMPLATES[k].displayName);
-      const selectedLabel = await ctx.ui.select("Select Provider", labels);
-      if (!selectedLabel) { ctx.ui.notify("Login cancelled.", "info"); return; }
-      const key = keys[labels.indexOf(selectedLabel)];
+      // Step 1 — pick provider template. Searchable because TEMPLATES has ~39
+      // entries, none of which a flat un-scrollable list makes reachable.
+      const key = await pickFromList(ctx, "Select Provider", providerPickerItems());
+      if (!key) { ctx.ui.notify("Login cancelled.", "info"); return; }
       const tpl = TEMPLATES[key];
 
       // Step 2 — base URL
@@ -1171,18 +1445,21 @@ export default async function (pi: ExtensionAPI) {
       if (providerKeys.length === 1) {
         keys = providerKeys;
       } else {
-        const ALL = "All providers";
-        // Embed the internal provider key in each label so duplicate
-        // displayNames (or a provider literally named "All providers") can't
-        // collide with each other or the special "All providers" option.
-        const options = providerKeys.map((k) => ({
-          key: k,
-          label: `${config.providers[k].displayName} [${k}]`,
-        }));
-        const labels = [ALL, ...options.map((o) => o.label)];
-        const chosen = await ctx.ui.select("Refresh which provider?", labels);
+        // The picker returns the provider key itself, so duplicate displayNames
+        // (or a provider literally named "All providers") can't collide with each
+        // other or with the special all-providers entry. NUL can't appear in a key.
+        const REFRESH_ALL = "\u0000all";
+        const chosen = await pickFromList(ctx, "Refresh which provider?", [
+          {
+            value: REFRESH_ALL,
+            label: "All providers",
+            description: `${providerKeys.length} providers`,
+            keywords: "all every",
+          },
+          ...registeredProviderItems(config.providers),
+        ]);
         if (!chosen) { ctx.ui.notify("Cancelled.", "info"); return; }
-        keys = chosen === ALL ? providerKeys : [options[labels.indexOf(chosen) - 1].key];
+        keys = chosen === REFRESH_ALL ? providerKeys : [chosen];
       }
 
       const refreshed: string[] = [];
@@ -1245,10 +1522,13 @@ export default async function (pi: ExtensionAPI) {
         const ok = await ctx.ui.confirm("Remove Provider", `Unregister "${name}"?`);
         if (!ok) { ctx.ui.notify("Cancelled.", "info"); return; }
       } else {
-        const labels = providerKeys.map((k) => config.providers[k].displayName);
-        const chosen = await ctx.ui.select("Remove which provider?", labels);
+        const chosen = await pickFromList(
+          ctx,
+          "Remove which provider?",
+          registeredProviderItems(config.providers)
+        );
         if (!chosen) { ctx.ui.notify("Cancelled.", "info"); return; }
-        key = providerKeys[labels.indexOf(chosen)];
+        key = chosen;
       }
 
       const name = config.providers[key].displayName;

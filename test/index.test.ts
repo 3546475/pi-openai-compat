@@ -20,12 +20,21 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import {
+  CURSOR_MARKER,
+  getKeybindings,
+  type Keybinding,
+  visibleWidth,
+} from "@mariozechner/pi-tui";
+
+import {
   TEMPLATES,
   KEYLESS_PLACEHOLDER,
   MAX_CONTEXT_WINDOW,
   MAX_OUTPUT_TOKENS,
   MAX_ERROR_BODY,
   CONFIG_FILE_MODE,
+  PICKER_MAX_VISIBLE,
+  SearchablePicker,
   buildProviderModels,
   compatKey,
   fetchModels,
@@ -34,9 +43,13 @@ import {
   mergeModelMetadata,
   normalizeInput,
   normalizeTokenCount,
+  pickFromList,
+  providerPickerItems,
+  registeredProviderItems,
   registerProvider,
   restrictPermissions,
   tryRegisterProvider,
+  type PickerItem,
 } from "../index.ts";
 
 /**
@@ -459,5 +472,230 @@ describe("catalog failures: a missing endpoint is not a bad key", () => {
         );
       }
     }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+describe("Provider selection is searchable (39 templates do not fit a flat list)", () => {
+  /**
+   * pi's own `ctx.ui.select()` cannot be used for this list: it renders every
+   * option at once with no search and no scrolling, so the templates at the end
+   * of TEMPLATES are only reachable by counting arrow presses. The picker below
+   * wraps pi-tui's `SelectList` (which scrolls) and re-filters it with
+   * `fuzzyFilter` — the matcher behind pi's /model picker — because
+   * `SelectList.setFilter` only matches a *prefix* of the item value.
+   */
+  const theme = {
+    fg: (_color: string, text: string) => text,
+    bold: (text: string) => text,
+  };
+
+  function pickerFor(items: PickerItem[]) {
+    const picked: Array<string | null> = [];
+    const picker = new SearchablePicker({
+      title: "Select Provider",
+      items,
+      theme,
+      keybindings: getKeybindings(),
+      tui: { requestRender() {} },
+      done: (value) => picked.push(value),
+    });
+    return { picker, picked };
+  }
+
+  /**
+   * The byte sequence the real keybinding manager accepts for `id`, so the tests
+   * do not hard-code escape codes that a keybinding change could invalidate.
+   */
+  function keyFor(id: Keybinding): string {
+    const sequence = [
+      "\r",
+      "\n",
+      "\u001b",
+      "\u001b[A",
+      "\u001b[B",
+      "\u001b[5~",
+      "\u001b[6~",
+      "\u007f",
+      "\b",
+    ].find((data) => getKeybindings().matches(data, id));
+    assert.ok(sequence, `no key sequence found for ${id}`);
+    return sequence;
+  }
+
+  const ANSI = /\u001b\[[0-9;]*m/g;
+  const lines = (picker: SearchablePicker, width = 80) =>
+    picker.render(width).map((line) => line.replace(ANSI, ""));
+  /** Rendered provider rows, excluding the "(position/total)" indicator line. */
+  const rows = (picker: SearchablePicker) =>
+    lines(picker).filter((line) => (line.startsWith("  ") || line.startsWith("→ ")) && !/\(\d+\/\d+\)/.test(line));
+  const highlighted = (picker: SearchablePicker) => rows(picker).find((line) => line.startsWith("→ ")) ?? "";
+
+  function typeInto(picker: SearchablePicker, text: string): void {
+    for (const char of text) picker.handleInput(char);
+  }
+
+  test("only a screenful of the template list is rendered, with a position indicator", () => {
+    const { picker } = pickerFor(providerPickerItems());
+    assert.equal(rows(picker).length, PICKER_MAX_VISIBLE);
+    assert.ok(lines(picker).some((line) => line.includes(`(1/${Object.keys(TEMPLATES).length})`)));
+  });
+
+  test("a template near the end of the list is reachable by typing its endpoint", () => {
+    // Choosing Zhipu used to mean pressing ↓ eleven times and hoping.
+    const { picker, picked } = pickerFor(providerPickerItems());
+    typeInto(picker, "open.bigmodel");
+    assert.equal(rows(picker).length, 1);
+    assert.match(highlighted(picker), /Zhipu/);
+    picker.handleInput(keyFor("tui.select.confirm"));
+    assert.deepEqual(picked, ["zhipu"], "the pick must be the template key, not its label");
+  });
+
+  test("filtering is case-insensitive", () => {
+    const { picker } = pickerFor(providerPickerItems());
+    typeInto(picker, "GROQ");
+    assert.equal(rows(picker).length, 1);
+    assert.match(highlighted(picker), /Groq/);
+  });
+
+  test("a subsequence query matches (nsr → Nous Research Portal)", () => {
+    const { picker } = pickerFor(providerPickerItems());
+    typeInto(picker, "nsr");
+    assert.match(highlighted(picker), /Nous Research Portal/);
+  });
+
+  test("the highlighted row is the one Enter returns", () => {
+    const { picker, picked } = pickerFor(providerPickerItems());
+    typeInto(picker, "groq");
+    picker.handleInput(keyFor("tui.select.confirm"));
+    assert.deepEqual(picked, ["groq"]);
+  });
+
+  test("arrow keys move the highlight and wrap at both ends", () => {
+    const { picker } = pickerFor(providerPickerItems());
+    const keys = Object.keys(TEMPLATES);
+    const nameOf = (key: string) => TEMPLATES[key].displayName;
+    picker.handleInput(keyFor("tui.select.down"));
+    assert.ok(highlighted(picker).includes(nameOf(keys[1])));
+    picker.handleInput(keyFor("tui.select.up"));
+    assert.ok(highlighted(picker).includes(nameOf(keys[0])));
+    picker.handleInput(keyFor("tui.select.up"));
+    assert.ok(highlighted(picker).includes(nameOf(keys[keys.length - 1])), "↑ from the top wraps to the bottom");
+    picker.handleInput(keyFor("tui.select.down"));
+    assert.ok(highlighted(picker).includes(nameOf(keys[0])), "↓ from the bottom wraps to the top");
+  });
+
+  test("PageDown moves a screenful and the indicator follows", () => {
+    const { picker } = pickerFor(providerPickerItems());
+    const keys = Object.keys(TEMPLATES);
+    picker.handleInput(keyFor("tui.select.pageDown"));
+    assert.ok(lines(picker).some((line) => line.includes(`(${PICKER_MAX_VISIBLE + 1}/${keys.length})`)));
+    assert.ok(highlighted(picker).includes(TEMPLATES[keys[PICKER_MAX_VISIBLE]].displayName));
+  });
+
+  test("clearing the query restores every template", () => {
+    const { picker } = pickerFor(providerPickerItems());
+    typeInto(picker, "groq");
+    assert.equal(rows(picker).length, 1);
+    for (let i = 0; i < "groq".length; i++) picker.handleInput(keyFor("tui.editor.deleteCharBackward"));
+    assert.equal(rows(picker).length, PICKER_MAX_VISIBLE);
+    assert.ok(lines(picker).some((line) => line.includes(`(1/${Object.keys(TEMPLATES).length})`)));
+  });
+
+  test("a query that matches nothing says so, and Enter then picks nothing", () => {
+    // Synthetic items: no real query is guaranteed to miss every template.
+    const { picker, picked } = pickerFor([
+      { value: "alpha", label: "Alpha" },
+      { value: "beta", label: "Beta" },
+    ]);
+    typeInto(picker, "zzzz");
+    assert.equal(rows(picker).length, 0);
+    assert.ok(lines(picker).some((line) => line.includes("No matching providers")));
+    picker.handleInput(keyFor("tui.select.confirm"));
+    assert.deepEqual(picked, []);
+  });
+
+  test("Escape cancels with null, so callers can treat falsy as 'backed out'", () => {
+    const { picker, picked } = pickerFor(providerPickerItems());
+    picker.handleInput(keyFor("tui.select.cancel"));
+    assert.deepEqual(picked, [null]);
+  });
+
+  test("rows are truncated to the terminal width instead of wrapping", () => {
+    const { picker } = pickerFor(providerPickerItems());
+    for (const width of [40, 80]) {
+      for (const line of picker.render(width)) {
+        assert.ok(visibleWidth(line) <= width, `${width} columns: ${JSON.stringify(line)}`);
+      }
+    }
+  });
+
+  test("focus reaches the search box, so the terminal cursor (IME) lands there", () => {
+    const { picker } = pickerFor(providerPickerItems());
+    assert.ok(!picker.render(80).some((line) => line.includes(CURSOR_MARKER)));
+    picker.focused = true;
+    assert.equal(picker.focused, true);
+    assert.ok(picker.render(80).some((line) => line.includes(CURSOR_MARKER)));
+  });
+
+  test("providerPickerItems covers every template once, keyed by template key", () => {
+    const items = providerPickerItems();
+    const keys = Object.keys(TEMPLATES);
+    assert.equal(items.length, keys.length);
+    assert.equal(new Set(items.map((item) => item.value)).size, keys.length);
+    for (const item of items) {
+      assert.ok(item.value in TEMPLATES, `${item.value} is not a template key`);
+      assert.equal(item.label, TEMPLATES[item.value].displayName);
+      assert.equal(item.keywords, item.value, "the key must be searchable, not only the label");
+    }
+  });
+
+  test("registeredProviderItems keeps same-named providers distinguishable", () => {
+    // Two providers can share a display name; the internal key is what tells
+    // them apart, and it has to survive as the picked value.
+    const items = registeredProviderItems({
+      groq: { displayName: "Groq" },
+      groq_lan: { displayName: "Groq" },
+    });
+    assert.deepEqual(
+      items.map((item) => item.value),
+      ["groq", "groq_lan"],
+    );
+    assert.deepEqual(
+      items.map((item) => item.description),
+      ["[groq]", "[groq_lan]"],
+    );
+    const { picker, picked } = pickerFor(items);
+    typeInto(picker, "lan");
+    assert.equal(rows(picker).length, 1);
+    picker.handleInput(keyFor("tui.select.confirm"));
+    assert.deepEqual(picked, ["groq_lan"]);
+  });
+
+  test("pickFromList drives ctx.ui.custom and resolves with the pick", async () => {
+    let customCalls = 0;
+    // The factory parameters and return are `any` here on purpose: this mock's
+    // only job is to hand the component to the test and resolve when it is done.
+    const ctx = {
+      ui: {
+        custom<T>(
+          factory: (
+            tui: any,
+            theme: any,
+            keybindings: any,
+            done: (result: T) => void,
+          ) => any,
+        ): Promise<T> {
+          customCalls++;
+          return new Promise<T>((resolve) => {
+            const component = factory({ requestRender() {} }, theme, getKeybindings(), resolve);
+            for (const char of "groq") component.handleInput(char);
+            component.handleInput(keyFor("tui.select.confirm"));
+          });
+        },
+      },
+    };
+    assert.equal(await pickFromList(ctx, "Select Provider", providerPickerItems()), "groq");
+    assert.equal(customCalls, 1);
   });
 });
