@@ -60,6 +60,12 @@ const BUILTIN = {
     keyless: false,
     keyHint: "tokenharbor.ai/dashboard/api-keys (Universal Key, format thk_live_...; docs at tokenharbor.ai/docs)",
   },
+  tokenrouter: {
+    displayName: "TokenRouter",
+    baseUrl: "https://api.tokenrouter.com/v1",
+    keyless: false,
+    keyHint: "tokenrouter.com console (model prices at tokenrouter.com/models)",
+  },
   atria_asi: {
     displayName: "Atria ASI",
     baseUrl: "https://api.atria-asi.ai/v1",
@@ -110,6 +116,7 @@ const BUILTIN_AUTH = {
   teamorouter: "`sk-teamo-...` key from teamorouter.com (teamorouter.com/docs)",
   gmi: "API key from console.gmicloud.ai → Organization Settings → API Keys",
   tokenharbor: "`thk_live_...` Universal Key from tokenharbor.ai/dashboard/api-keys",
+  tokenrouter: "API key from the TokenRouter console at tokenrouter.com (model prices at tokenrouter.com/models)",
   atria_asi: "`atr_...` key from api.atria-asi.ai/console/keys (Google sign-in)",
   unbiased_ai: "`sk_...` key from platform.unbiased.ai (signup reviewed by hand)",
   kilo: "API key from app.kilo.ai → Your Profile (personal account), at the bottom of the page; needs account credits",

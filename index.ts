@@ -395,6 +395,17 @@ export const TEMPLATES: Record<string, {
     // One "Universal Key" reaches every model; free models carry a ":free" id suffix.
     keyHint: "tokenharbor.ai/dashboard/api-keys (Universal Key, format thk_live_...; docs at tokenharbor.ai/docs)",
   },
+  tokenrouter: {
+    displayName: "TokenRouter",
+    baseUrl: "https://api.tokenrouter.com/v1",
+    keyless: false,
+    // Multi-vendor gateway (a new-api deployment). GET /v1/models is key-gated
+    // (it answers 401 "Invalid token" JSON without a key, where an unknown /v1
+    // path answers 404 "Invalid URL" JSON), which is exactly what fetchModels
+    // already sends, so no modelsUrl or fallbackModels override is needed.
+    // Per-model prices are listed at tokenrouter.com/models.
+    keyHint: "tokenrouter.com console (model prices at tokenrouter.com/models)",
+  },
   atria_asi: {
     displayName: "Atria ASI",
     baseUrl: "https://api.atria-asi.ai/v1",

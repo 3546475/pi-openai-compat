@@ -66,6 +66,7 @@ If pi is already running when you install, type `/reload` first.
 | **TeamoRouter** | `https://api.teamorouter.com/v1` | `sk-teamo-...` key from teamorouter.com (teamorouter.com/docs) |
 | **GMI Cloud** | `https://api.gmi-serving.com/v1` | API key from console.gmicloud.ai → Organization Settings → API Keys |
 | **Token Harbor** | `https://tokenharbor.ai/v1` | `thk_live_...` Universal Key from tokenharbor.ai/dashboard/api-keys |
+| **TokenRouter** | `https://api.tokenrouter.com/v1` | API key from the TokenRouter console at tokenrouter.com (model prices at tokenrouter.com/models) |
 | **Atria ASI** | `https://api.atria-asi.ai/v1` | `atr_...` key from api.atria-asi.ai/console/keys (Google sign-in) |
 | **Unbiased AI** | `https://api.unbiased.ai/v1` | `sk_...` key from platform.unbiased.ai (signup reviewed by hand) |
 | **Kilo AI** | `https://api.kilo.ai/api/gateway` | API key from app.kilo.ai → Your Profile (personal account), at the bottom of the page; needs account credits |
